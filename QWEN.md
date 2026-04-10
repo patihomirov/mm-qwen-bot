@@ -1,139 +1,196 @@
-# mm-qwen-bot
+# mm-qwen-bot — Контекст проекта
 
-Mattermost-бот для общения с AI-ассистентом (Claude / Qwen Code). Каждый канал MM = один проект.
+## Что это
 
-## Управление проектами
+Mattermost-бот для общения с AI-ассистентом. Поддерживает переключаемый backend:
+- **Qwen Code** (`qwen -p -o stream-json --yolo`)
+- **Claude** (`claude --print --verbose --output-format stream-json`)
 
-Конфиг проектов: `data/projects.json`. Формат:
-```json
-{
-  "ключ": {
-    "name": "Отображаемое имя",
-    "path": "/абсолютный/путь/к/проекту",
-    "channel": "имя-канала-в-mattermost"
-  }
-}
-```
+Переключение через переменную окружения `AI_BACKEND=qwen|claude`.
 
-## Как добавить проект
-
-1. Отредактируй `data/projects.json` — добавь запись
-2. Пользователь выполнит `!reload` в любом канале — бот подхватит изменения
-3. Канал в Mattermost нужно создать отдельно (бот не создаёт каналы сам)
-
-## Как удалить проект
-
-1. Удали запись из `data/projects.json`
-2. `!reload`
-
-## Команды бота
-- `!go` — режим работы (AI может редактировать файлы)
-- `!discuss` — режим обсуждения (только чтение)
-- `!new` — новая сессия
-- `!stop` — остановить AI
-- `!status` — текущий статус
-- `!reload` — перечитать projects.json
-- `!help` — справка
-
-## Переключение backend
-
-Backend задаётся через переменную окружения `AI_BACKEND`:
-- `qwen` (по умолчанию) — Qwen Code
-- `claude` — Claude (Anthropic)
-
-Чтобы переключить:
-1. Измени `AI_BACKEND` в `.env`
-2. Перезапусти бота
-3. При первом обращении к старой сессии бот предупредит что диалог был начат с другим AI
-
-## Архитектура
+## Структура репозитория
 
 ```
 mm-qwen-bot/
 ├── bot/
-│   ├── __init__.py
-│   ├── main.py              # Точка входа, WebSocket слушатель MM
-│   ├── handlers.py          # Обработка сообщений и команд
-│   ├── universal_runner.py  # Универсальный runner (Claude/Qwen)
-│   ├── session.py           # Управление сессиями и состоянием
-│   └── stt.py               # Speech-to-Text через Groq Whisper
-├── data/
-│   ├── projects.json        # Конфиг проектов
-│   └── state.json           # Состояние сессий (session_id, mode, backend)
+│   ├── __init__.py           # Пакет
+│   ├── main.py               # Точка входа: MM WebSocket слушатель
+│   ├── handlers.py           # Обработка сообщений, команд, файлов
+│   ├── universal_runner.py   # Универсальный runner (Claude/Qwen)
+│   ├── session.py            # Управление сессиями, state.json
+│   └── stt.py                # Speech-to-Text через Groq Whisper
 ├── tools/
-│   └── rename_bot.py        # Скрипт переименования бота в MM
-├── .env                     # Переменные окружения
+│   └── rename_bot.py         # Переименование бота в MM
+├── data/                     # НЕ в git — создаётся на сервере
+│   ├── projects.json         # Конфиг проектов
+│   └── state.json            # Сессии (session_id, mode, backend)
+├── QWEN.md                   # Этот файл — контекст для AI
+├── README.md                 # Документация для GitHub
+├── CONTRIBUTING.md           # Гайд для контрибьюторов
+├── MIGRATION.md              # Миграция с mm-claude-bot
+├── .env.example              # Шаблон env
+├── .gitignore
+├── LICENSE                   # MIT
 ├── requirements.txt
-└── start.sh
+├── start.sh
+└── example-projects.json
 ```
 
-## Ключевые решения
+## Как работает
 
-### universal_runner.py
-Единый интерфейс для обоих backend. Оба используют stream-json формат:
-- **Claude**: `claude --print --verbose --output-format stream-json`
-- **Qwen Code**: `qwen -p -o stream-json --yolo`
+### Архитектура
 
-Безопасность в discuss mode обеспечивается через `--disallowed-tools` / `--exclude-tools`, а не через интерактивное подтвер.
+```
+Mattermost (WebSocket) → handlers.py → universal_runner.py → Qwen/Claude CLI
+                                              ↓
+                                        stream-json ←─── response
+```
 
-### Сессии
-- Каждый поток в Mattermost = отдельная сессия AI
-- `state.json` хранит `session_id`, `mode` и `backend` для каждого треда
-- При смене backend бот видит mismatch и предупреждает пользователя
-- `!new` сбрасывает session_id и backend — можно использовать с любым AI
+1. **main.py** подключается к Mattermost WebSocket, слушает сообщения
+2. **handlers.py** маршрутизирует: команды (`!go`, `!discuss`, `!new`) или текст
+3. **universal_runner.py** запускает CLI subprocess с правильными флагами
+4. Оба backend возвращают stream-json → парсим → отправляем ответ в MM
 
-### Поиск бинарников
-`_find_binary()` ищет CLI в: env override → PATH → ~/.local/bin → ~/.npm-global/bin → /usr/local/bin
+### Ключевые решения
 
-### Язык ответа
-Ко всем сообщениям добавляется инструкция отвечать на русском языке.
+#### universal_runner.py
+- Оба backend используют `stream-json` формат (идентичный)
+- Qwen: `--yolo` + `--exclude-tools` для безопасности (не `--approval-mode`)
+- Claude: `--dangerously-skip-permissions` или `--disallowedTools`
+- `_find_binary()` ищет в: env override → PATH → `~/.npm-global/bin` → `~/.local/bin`
+- Контекст проекта: AI сам читает QWEN.md/CLAUDE.md через `read_file` в первом ходу
 
-## История разработки
+#### handlers.py
+- Backend задаётся через `AI_BACKEND` env var (глобально, не per-project)
+- При смене backend: если `session.backend != DEFAULT_BACKEND` → предупреждение, не обрабатывать сообщение
+- `!new` сбрасывает session_id и backend
+- Язык: префикс к каждому сообщению пользователя — «respond in Russian»
+- Файлы: аудио → Groq Whisper STT, изображения → read_file, код → inline
 
-### 2026-04-10 — Миграция с mm-claude-bot
+#### session.py
+- `ThreadSession` хранит: `session_id`, `mode`, `backend`
+- При загрузке state.json старый backend = «» (пусто)
+- Qwen session_id = UUID (36 chars, 4 дефиса). Claude — другой формат.
+- Продолжение сессии только если backend совпадает
 
-**Проблема:** Бот работал только с Claude. Нужно поддерживать Qwen Code и переключение между ними.
+### Команды бота
 
-**Решения и итерации:**
+| Команда | Описание |
+|---------|----------|
+| `!go` | Work mode — AI может редактировать файлы |
+| `!discuss` | Discuss mode — только чтение |
+| `!new` | Новая сессия (сброс session_id + backend) |
+| `!stop` | Остановить текущий запрос |
+| `!status` | Показать текущий backend, mode, проект |
+| `!reload` | Перечитать projects.json |
+| `!help` | Справка |
 
-1. **Первоначальная идея:** `claude_runner.py` + `qwen_runner.py` + переключатель
-   - Отклонено → сделали единый `universal_runner.py`
+### Переключение backend
 
-2. **Поиск бинарников:** Первый запуск упал с "No such file or directory: qwen"
-   - Причина: `~/.npm-global/bin` не в PATH процесса бота
-   - Решение: `_find_binary()` проверяет `QWEN_PATH` env и `~/.npm-global/bin/`
+```bash
+# В .env файле:
+AI_BACKEND=qwen    # или claude
+# Перезапуск бота
+```
 
-3. **Non-interactive режим Qwen:** Бот зависал без ответа
-   - Причина: `--approval-mode auto-edit` не работает с `-p` + stdin
-   - Решение: `--yolo` + `--exclude-tools` для безопасности в discuss mode
+При первом обращении к старой сессии бот отвечает:
+> ⚠️ Этот диалог был начат с **Claude**.
+> Сейчас бот работает на **Qwen**.
+> Чтобы продолжить — переключи бот обратно на Claude
+> Или используй `!new` чтобы начать новую сессию с Qwen.
 
-4. **Невалидные флаги:** `--disallowed-tools` не принят Qwen
-   - Причина: Qwen использует `--exclude-tools`, не `--disallowed-tools`
-   - Решение: разные флаги для Claude vs Qwen
+## Сервер (192.168.1.100)
 
-5. **Язык ответов:** Qwen отвечал на английском
-   - Причина: системный промпт не переопределяет язык
-   - Решение: префикс к каждому сообщению пользователя с инструкцией отвечать на русском
+### Пути
+- **Исходники**: `/home/p_tikhomirov/projects/linux_workstation_server/mm-qwen-bot/`
+- **Deploy**: `/home/p_tikhomirov/apps/mm-qwen-bot/` (симлинки на bot/, start.sh, requirements.txt, QWEN.md)
+- **Data**: `/home/p_tikhomirov/apps/mm-qwen-bot/data/` (projects.json, state.json)
+- **Tokens**: `/home/p_tikhomirov/.tokens/mm-qwen-bot.env` → symlink `.env`
 
-6. **Backend: env vs per-project:** Сначала backend в projects.json, потом в env
-   - Пользователь решил: один env var `AI_BACKEND` для всего бота
-   - Удалены команды `!backend` / `!backend claude` / `!backend qwen`
+### Установка
+```bash
+# Qwen Code
+npm install -g @qwen-code/qwen-code  # → ~/.npm-global/bin/qwen
+qwen auth qwen-oauth                 # OAuth настроен, Free tier
 
-7. **Сессии при смене backend:**
-   - Сначала: авто-сброс session_id при смене backend
-   - Пользователь: лучше предупредить и дать выбор
-   - Решение: если session.backend != DEFAULT_BACKEND → предупредить и не обрабатывать сообщение
+# Python venv
+cd ~/apps/mm-qwen-bot
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
 
-8. **QWEN.md/CLAUDE.md:** Сначала автозагрузка в system prompt
-   - Пользователь: лишние токены, плюс дублирование
-   - Решение: короткая инструкция в system prompt — AI сам прочитает файл через read_file
+# Запуск
+nohup python -m bot.main > /dev/null 2>&1 &
+```
 
-9. **Переименование бота:** `claude` → `ai-assistant`
-   - Старая учётка `claude-bot` деактивирована
+### .env (prod)
+```
+MM_URL=http://localhost:8065
+MM_BOT_TOKEN=sd9i35gatbng78q6rns3wpsj8h
+MM_OWNER_USERNAME=admin
+GROQ_API_KEY=gsk_...
+QWEN_PATH=/home/p_tikhomirov/.npm-global/bin/qwen
+STT_LANGUAGE=ru
+AI_BACKEND=qwen
+```
 
-10. **Удаление старого бота:** mm-claude-bot удалён с сервера
+### Mattermost
+- Bot user: `@ai-assistant` (display: «AI Assistant»)
+- Старый `@claude-bot` — деактивирован
+- Проекты: book, server, secretar, admin
 
-### Установленные зависимости на сервере
-- Qwen Code: `npm install -g @qwen-code/qwen-code` → `~/.npm-global/bin/qwen`
-- OAuth: `qwen auth qwen-oauth` (настроен, Free tier, 1000 req/day)
-- PATH: `~/.npm-global/bin` добавлен в `.bashrc`
+## GitHub
+
+- Репозиторий: https://github.com/patihomirov/mm-qwen-bot
+- SSH-ключ на сервере привязан к GitHub (patihomirov)
+- Ветка: `main`, 1 коммит
+
+## Что делать при доработке
+
+1. **Добавить новый backend**:
+   - Константа в `universal_runner.py` → `BACKEND_NEW`
+   - Логика в `_build_args()` для нового backend
+   - Маппинг в `BACKEND_DISPLAY` в `handlers.py`
+
+2. **Изменить поведение**:
+   - `handlers.py` — маршрутизация, команды, обработка файлов
+   - `universal_runner.py` — флаги CLI, system prompt
+   - `session.py` — структура сессии
+
+3. **Обновить контекст**: после значительных изменений обнови этот файл
+
+## История разработки (2026-04-10)
+
+### Проблемы и решения (итерации)
+
+1. **PATH**: `qwen` не найден — `~/.npm-global/bin` не в PATH процесса
+   → `_find_binary()` проверяет env и стандартные пути
+
+2. **Non-interactive**: `--approval-mode auto-edit` не работает с `-p` + stdin
+   → `--yolo` + `--exclude-tools` для безопасности
+
+3. **Флаги**: `--disallowed-tools` не принят Qwen
+   → Qwen использует `--exclude-tools`
+
+4. **Язык**: системный промпт не переопределяет язык ответа
+   → Префикс к сообщению пользователя: «respond in Russian»
+
+5. **Backend scope**: сначала per-project в projects.json, потом глобальный env
+   → `AI_BACKEND` env var + рестарт
+
+6. **Сессии при смене backend**: сначала авто-сброс, потом предупреждение
+   → Если mismatch → «переключи обратно или !new»
+
+7. **Контекст QWEN.md/CLAUDE.md**: сначала автозагрузка → лишние токены
+   → Инструкция в system prompt — AI сам читает через `read_file`
+
+8. **Переименование**: `claude` → `ai-assistant`, `claude-bot` деактивирован
+
+## TODO / Идеи
+
+- [ ] Интеграция с Mattermost slash commands (не только bot messages)
+- [ ] Webhook для уведомления о завершении длительных задач
+- [ ] Поддержка MCP servers
+- [ ] Тесты (mock Mattermost WebSocket)
+- [ ] Dockerfile для простого деплоя
+- [ ] Rate limiting / cost tracking
