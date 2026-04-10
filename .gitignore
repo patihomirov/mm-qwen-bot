@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Bot secrets
+.env
+.env.local
+.env.backup
+.tokens/
+
+# Bot runtime data
+data/state.json
+data/tmp/
+*.log
+bot.log
+bot_nohup.log
+
+# Session files
+.qwen/
+.claude/
+sessions/
+plans/
+
+# OS specific
+node_modules/

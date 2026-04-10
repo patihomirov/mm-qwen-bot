@@ -1,0 +1,26 @@
+{
+  "book": {
+    "name": "📖 Книга «Оно сломалось»",
+    "path": "/home/p_tikhomirov/projects/ono_slomalos",
+    "channel": "book",
+    "backend": "qwen"
+  },
+  "server": {
+    "name": "🖥️ Домашний сервер",
+    "path": "/home/p_tikhomirov/go/sandbox/linux_workstation_server",
+    "channel": "server",
+    "backend": "qwen"
+  },
+  "secretar": {
+    "name": "🤖 AI-секретарь",
+    "path": "/home/p_tikhomirov/projects/ai-secretar",
+    "channel": "secretar",
+    "backend": "qwen"
+  },
+  "admin": {
+    "name": "⚙️ Управление ботом",
+    "path": "/home/p_tikhomirov/apps/mm-qwen-bot",
+    "channel": "admin",
+    "backend": "qwen"
+  }
+}
