@@ -68,7 +68,8 @@ Mattermost (WebSocket) → handlers.py → universal_runner.py → Qwen/Claude C
 - Файлы: аудио → Groq Whisper STT, изображения → read_file, код → inline
 
 #### session.py
-- `ThreadSession` хранит: `session_id`, `mode`, `backend`
+- `ThreadSession` хранит: `session_id`, `mode`, `backend`, `summary`
+- `summary` — результат `!compress`: AI суммирует разговор, сохраняется в state.json
 - При загрузке state.json старый backend = «» (пусто)
 - Qwen session_id = UUID (36 chars, 4 дефиса). Claude — другой формат.
 - Продолжение сессии только если backend совпадает
@@ -79,11 +80,31 @@ Mattermost (WebSocket) → handlers.py → universal_runner.py → Qwen/Claude C
 |---------|----------|
 | `!go` | Work mode — AI может редактировать файлы |
 | `!discuss` | Discuss mode — только чтение |
-| `!new` | Новая сессия (сброс session_id + backend) |
+| `!new` | Новая сессия (сброс session_id + backend + summary) |
+| `!compress` | Сжать сессию: AI суммирует разговор → новая сессия с контекстом |
 | `!stop` | Остановить текущий запрос |
 | `!status` | Показать текущий backend, mode, проект |
 | `!reload` | Перечитать projects.json |
 | `!help` | Справка |
+
+### Компрессия сессий (`!compress`)
+
+Когда сессия становится слишком длинной (большой контекст), AI может деградировать в качестве ответов. Команда `!compress`:
+
+1. Отправляет AI запрос с промптом «суммируй наш разговор»
+2. AI возвращает краткое резюме (3-7 абзацев)
+3. Бот сохраняет резюме в `session.summary` и сбрасывает `session_id`
+4. Следующее сообщение пользователя начинает **новую сессию**
+5. В новое сообщение инжектируется резюме как system prompt:
+   ```
+   COMPRESSED CONTEXT FROM PREVIOUS SESSION:
+   --- BEGIN SUMMARY ---
+   {summary}
+   --- END SUMMARY ---
+   ```
+6. После inject summary очищается — не дублируется в следующих сообщениях
+
+**Результат:** контекст AI обнуляется, но ключевая информация сохранена.
 
 ### Переключение backend
 
@@ -107,6 +128,7 @@ AI_BACKEND=qwen    # или claude
 - **Data**: `/home/p_tikhomirov/apps/mm-qwen-bot/data/` (projects.json, state.json)
 - **Tokens**: `/home/p_tikhomirov/.tokens/mm-qwen-bot.env` → symlink `.env`
 
+<<<<<<< Updated upstream
 ### Git-репозитории
 
 | Где | URL | Назначение |
@@ -175,6 +197,45 @@ AI_BACKEND=qwen
 - Bot user: `@ai-assistant` (display: «AI Assistant»)
 - Старый `@claude-bot` — деактивирован
 - Проекты: book, server, secretar, admin
+=======
+### Установка
+```bash
+# Qwen Code
+npm install -g @qwen-code/qwen-code  # → ~/.npm-global/bin/qwen
+qwen auth qwen-oauth                 # OAuth настроен, Free tier
+
+# Python venv
+cd ~/apps/mm-qwen-bot
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
+# Запуск
+nohup python -m bot.main > /dev/null 2>&1 &
+```
+
+### .env (prod)
+```
+MM_URL=http://localhost:8065
+MM_BOT_TOKEN=sd9i35gatbng78q6rns3wpsj8h
+MM_OWNER_USERNAME=admin
+GROQ_API_KEY=gsk_...
+QWEN_PATH=/home/p_tikhomirov/.npm-global/bin/qwen
+STT_LANGUAGE=ru
+AI_BACKEND=qwen
+```
+
+### Mattermost
+- Bot user: `@ai-assistant` (display: «AI Assistant»)
+- Старый `@claude-bot` — деактивирован
+- Проекты: book, server, secretar, admin
+
+## GitHub
+
+- Репозиторий: https://github.com/patihomirov/mm-qwen-bot
+- SSH-ключ на сервере привязан к GitHub (patihomirov)
+- Ветка: `main`, 1 коммит
+>>>>>>> Stashed changes
 
 ## Что делать при доработке
 
@@ -220,8 +281,15 @@ AI_BACKEND=qwen
 ## TODO / Идеи
 
 - [ ] Интеграция с Mattermost slash commands (не только bot messages)
+<<<<<<< Updated upstream
+=======
+- [ ] Webhook для уведомления о завершении длительных задач
+>>>>>>> Stashed changes
 - [ ] Поддержка MCP servers
 - [ ] Тесты (mock Mattermost WebSocket)
 - [ ] Dockerfile для простого деплоя
 - [ ] Rate limiting / cost tracking
+<<<<<<< Updated upstream
 - [ ] Telegram → Mattermost миграция (переезд бота)
+=======
+>>>>>>> Stashed changes
