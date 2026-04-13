@@ -1,4 +1,8 @@
-"""Mattermost message handlers with thread support and switchable AI backend."""
+"""Mattermost message handlers with thread support and switchable AI backend.
+
+Work isolation: !go creates a feature branch, clones to ~/work/<project>-<uuid>/,
+AI works in isolation, then commits + pushes + creates MR in Forgejo.
+"""
 
 import asyncio
 import logging
@@ -7,13 +11,14 @@ import re
 
 from . import stt
 from .universal_runner import (
-    UniversalRunner, ToolUseEvent, FinalResult, ErrorResult,
+    UniversalRunner, ToolUseEvent, TextDelta, FinalResult, ErrorResult,
     create_runner, BACKEND_CLAUDE, BACKEND_QWEN, VALID_BACKENDS,
 )
 from .session import (
     PROJECTS, UserState, load_state, save_state, project_for_channel,
-    reload_projects, PROJECTS_FILE,
+    reload_projects, PROJECTS_FILE, ThreadSession, WORK_DIR,
 )
+from . import forgejo_api
 
 logger = logging.getLogger(__name__)
 
@@ -136,19 +141,81 @@ class MessageHandler:
         backend_name = BACKEND_DISPLAY.get(DEFAULT_BACKEND, DEFAULT_BACKEND.title())
 
         if cmd == "!go":
+            session = state.ensure_session(project_key, thread_id)
+
+            # If already working, just confirm
+            if session.is_working:
+                self._post(channel_id,
+                    f"⚡ Уже в work mode.\n"
+                    f"📂 `{session.work_dir}`\n"
+                    f"🌿 `{session.branch}`\n"
+                    f"Используй `!finish` когда AI закончит.",
+                    thread_id,
+                )
+                return
+
+            # Create work isolation: branch + clone
+            self._post(channel_id, "🔨 Создаю изолированную рабочую среду...", thread_id)
+
+            forgejo_repo = forgejo_api.get_forgejo_repo_name(project_key)
+            work_dir = session.generate_work_dir(project_key)
+            default_branch = "master"
+
+            try:
+                # Get the actual default branch
+                default_branch = forgejo_api.get_default_branch(forgejo_repo)
+            except Exception as e:
+                logger.warning("Could not get default branch: %s", e)
+
+            # Create the feature branch in Forgejo
+            if not forgejo_api.create_branch(forgejo_repo, session.branch, from_branch=default_branch):
+                self._post(channel_id, f"❌ Не удалось создать ветку `{session.branch}`", thread_id)
+                return
+
+            # Clone to work directory
+            if not forgejo_api.clone_repo(forgejo_repo, session.branch, work_dir):
+                self._post(channel_id, f"❌ Не удалось клонировать репозиторий", thread_id)
+                forgejo_api.cleanup_work_dir(work_dir)
+                return
+
             state.set_mode(project_key, thread_id, "work")
             self._save()
-            self._post(channel_id, f"⚡ Mode: **work**\n{backend_name} can edit files.\n`!discuss` to switch back.", thread_id)
+
+            self._post(channel_id,
+                f"⚡ Mode: **work**\n"
+                f"📂 `{work_dir}`\n"
+                f"🌿 `{session.branch}` (от `{default_branch}`)\n"
+                f"AI работает в изолированной копии.\n"
+                f"`!finish` — завершить, закоммитить, создать MR\n"
+                f"`!discuss` — выйти без сохранения",
+                thread_id,
+            )
 
         elif cmd == "!discuss":
             state.set_mode(project_key, thread_id, "discuss")
             self._save()
             self._post(channel_id, f"💬 Mode: **discuss** (read-only) — {backend_name}", thread_id)
 
+        elif cmd == "!finish":
+            await self._handle_finish(channel_id, thread_id, project_key)
+
+        elif cmd == "!mr":
+            await self._handle_mr_status(channel_id, thread_id, project_key)
+
+        elif cmd == "!cleanup":
+            await self._handle_cleanup(channel_id, thread_id, project_key)
+
         elif cmd == "!new":
             session = state.ensure_session(project_key, thread_id)
             session.session_id = ""
             session.backend = ""  # Clear backend so any backend can be used
+            session.summary = ""  # Clear compressed summary
+            # Also clear work isolation fields
+            session.work_dir = ""
+            session.branch = ""
+            session.mr_id = ""
+            session.mr_url = ""
+            session.project_key = ""
             self._save()
             backend_name = BACKEND_DISPLAY.get(DEFAULT_BACKEND, DEFAULT_BACKEND.title())
             self._post(channel_id,
@@ -156,6 +223,9 @@ class MessageHandler:
                 f"Backend: {backend_name}",
                 thread_id,
             )
+
+        elif cmd == "!compress":
+            await self._handle_compress(channel_id, thread_id, project_key)
 
         elif cmd == "!stop":
             runner = self._runners.get(thread_id)
@@ -170,14 +240,22 @@ class MessageHandler:
             mode = "⚡ work" if session and session.mode == "work" else "💬 discuss"
             runner = self._runners.get(thread_id)
             running = "▶️ yes" if runner and runner.is_running else "⏹ no"
-            self._post(channel_id,
+            msg = (
                 f"**Project:** {project.get('name', project_key)}\n"
                 f"📂 `{project.get('path', '?')}`\n"
                 f"**Backend:** {backend_name}\n"
                 f"**Mode:** {mode}\n"
-                f"**{backend_name}:** {running}",
-                thread_id,
+                f"**{backend_name}:** {running}"
             )
+            if session and session.is_working:
+                msg += (
+                    f"\n\n**Work:**\n"
+                    f"📂 `{session.work_dir}`\n"
+                    f"🌿 `{session.branch}`\n"
+                )
+                if session.mr_url:
+                    msg += f"🔗 [MR #{session.mr_id}]({session.mr_url})"
+            self._post(channel_id, msg, thread_id)
 
         elif cmd == "!reload":
             projects = reload_projects()
@@ -190,17 +268,138 @@ class MessageHandler:
         elif cmd == "!help":
             self._post(channel_id,
                 "**Commands:**\n"
-                "- `!go` — work mode (allow edits)\n"
+                "- `!go` — work mode (AI создаёт ветку, клонирует, редактирует)\n"
                 "- `!discuss` — discuss mode (read-only)\n"
+                "- `!finish` — завершить работу: commit → push → MR в Forgejo\n"
+                "- `!mr` — показать статус Merge Request\n"
+                "- `!cleanup` — удалить рабочую директорию без MR\n"
                 "- `!new` — new session in this thread\n"
+                "- `!compress` — сжать сессию: AI суммирует разговор → новая сессия с контекстом\n"
                 "- `!stop` — stop AI assistant\n"
                 "- `!status` — show current state\n"
                 "- `!reload` — reload projects from config\n\n"
                 f"**Backend:** {backend_name} (set via AI_BACKEND env var)\n"
                 "**Threads:** Each thread = separate session.\n"
-                "Start a new message for a new topic.",
+                "**Work:** `!go` → AI создаёт `feature/task-XXX` → `!finish` → MR",
                 thread_id,
             )
+
+    async def _handle_finish(self, channel_id: str, thread_id: str, project_key: str):
+        """Commit changes, push to Forgejo, create MR."""
+        state = self.get_state()
+        session = state.get_session(project_key, thread_id)
+
+        if not session or not session.is_working:
+            self._post(channel_id, "⚠️ Нет активной work сессии. Используй `!go` для начала.", thread_id)
+            return
+
+        forgejo_repo = forgejo_api.get_forgejo_repo_name(project_key)
+        self._post(channel_id, "📦 Коммичу изменения...", thread_id)
+
+        # Commit and push
+        if not forgejo_api.commit_and_push(session.work_dir, session.branch):
+            self._post(channel_id, "❌ Ошибка при коммите/пуше. Проверь логи.", thread_id)
+            return
+
+        # Check if there were actually changes
+        import subprocess
+        result = subprocess.run(
+            ["git", "log", "--oneline", "-1", "--format=%s"],
+            cwd=session.work_dir, capture_output=True, text=True, timeout=5,
+        )
+        last_commit = result.stdout.strip() if result.returncode == 0 else "No commits"
+
+        # Create MR
+        self._post(channel_id, "🔀 Создаю Merge Request...", thread_id)
+        default_branch = "master"
+        try:
+            default_branch = forgejo_api.get_default_branch(forgejo_repo)
+        except Exception:
+            pass
+
+        pr = forgejo_api.create_pull_request(
+            forgejo_repo,
+            session.branch,
+            title=f"AI: changes from mm-bot ({session.branch})",
+            body=f"Changes made by AI assistant via Mattermost.\n\nLast commit: `{last_commit}`\nBranch: `{session.branch}` → `{default_branch}`",
+            base_branch=default_branch,
+        )
+
+        if pr:
+            session.mr_id = str(pr.get("number", "?"))
+            session.mr_url = pr.get("html_url", f"{forgejo_api.FORGEJO_URL}/{forgejo_api.FORGEJO_OWNER}/{forgejo_repo}/pulls/{session.mr_id}")
+            self._save()
+            self._post(channel_id,
+                f"✅ MR создан!\n"
+                f"🔗 [{forgejo_repo} #{session.mr_id}]({session.mr_url})\n"
+                f"🌿 `{session.branch}` → `{default_branch}`\n\n"
+                f"Залитай MR в Forgejo. После мержа используй `!cleanup`.",
+                thread_id,
+            )
+        else:
+            self._post(channel_id,
+                f"⚠️ Changes pushed, but MR creation failed.\n"
+                f"🌿 Branch `{session.branch}` pushed to Forgejo.\n"
+                f"Создай MR вручную: `{forgejo_api.FORGEJO_URL}/{forgejo_api.FORGEJO_OWNER}/{forgejo_repo}/pulls`",
+                thread_id,
+            )
+
+    async def _handle_mr_status(self, channel_id: str, thread_id: str, project_key: str):
+        """Show current MR status for this session."""
+        state = self.get_state()
+        session = state.get_session(project_key, thread_id)
+
+        if not session or not session.mr_id:
+            self._post(channel_id, "⚠️ Нет активного Merge Request.", thread_id)
+            return
+
+        forgejo_repo = forgejo_api.get_forgejo_repo_name(project_key)
+        pr = forgejo_api.get_pull_request(forgejo_repo, int(session.mr_id))
+
+        if pr:
+            state_map = {"open": "🟢 open", "merged": "🟣 merged", "closed": "🔴 closed"}
+            state_str = state_map.get(pr.get("state", "unknown"), "⚪ unknown")
+            self._post(channel_id,
+                f"**MR #{session.mr_id}** {state_str}\n"
+                f"📝 {pr.get('title', '?')}\n"
+                f"🌿 `{pr.get('head', {}).get('ref', '?')}` → `{pr.get('base', {}).get('ref', '?')}`\n"
+                f"🔗 {session.mr_url}",
+                thread_id,
+            )
+        else:
+            self._post(channel_id, f"❌ MR #{session.mr_id} не найден в Forgejo.", thread_id)
+
+    async def _handle_cleanup(self, channel_id: str, thread_id: str, project_key: str):
+        """Remove work directory and reset session work fields."""
+        state = self.get_state()
+        session = state.get_session(project_key, thread_id)
+
+        if not session or not session.work_dir:
+            self._post(channel_id, "⚠️ Нет активной рабочей директории.", thread_id)
+            return
+
+        work_dir = session.work_dir
+        branch = session.branch
+
+        # Clean up
+        forgejo_api.cleanup_work_dir(work_dir)
+
+        # Reset work fields but keep session_id and backend
+        session.work_dir = ""
+        session.branch = ""
+        session.mr_id = ""
+        session.mr_url = ""
+        session.project_key = ""
+        session.mode = "discuss"
+        self._save()
+
+        self._post(channel_id,
+            f"🧹 Рабочая директория удалена.\n"
+            f"📂 `{work_dir}`\n"
+            f"🌿 `{branch}` (ветка осталась в Forgejo)\n\n"
+            f"Режим: 💬 discuss",
+            thread_id,
+        )
 
     async def _handle_files(self, file_ids: list[str], channel_id: str,
                             thread_id: str, project_key: str, caption: str) -> None:
@@ -262,6 +461,90 @@ class MessageHandler:
                 logger.exception("File processing error for %s", file_id)
                 self._post(channel_id, f"❌ Error processing file {file_id}", thread_id)
 
+    async def _handle_compress(self, channel_id: str, thread_id: str, project_key: str) -> None:
+        """Сжать сессию: попросить AI суммировать разговор, сохранить и начать новую сессию."""
+        state = self.get_state()
+        session = state.get_session(project_key, thread_id)
+        backend_name = BACKEND_DISPLAY.get(DEFAULT_BACKEND, DEFAULT_BACKEND.title())
+
+        if not session:
+            self._post(channel_id, "⚠️ Нет активной сессии.", thread_id)
+            return
+
+        if not session.session_id:
+            self._post(channel_id, "⚠️ Сессия ещё не инициализирована. Напиши что-нибудь сначала.", thread_id)
+            return
+
+        runner = self._get_runner(thread_id)
+        if runner.is_running:
+            self._post(channel_id, f"⏳ {backend_name} ещё работает. `!stop` для остановки.", thread_id)
+            return
+
+        self._post(channel_id, "🗜️ Сжимаю сессию... Это займёт минуту.", thread_id)
+
+        project = PROJECTS.get(project_key, {})
+        cwd = session.work_dir if session.is_working else project.get("path", os.getcwd())
+
+        # Summarization prompt
+        compress_prompt = (
+            "Сделай краткое резюме нашего разговора. Включи:\n"
+            "1. Какую задачу мы решаем\n"
+            "2. Что уже сделано и какие решения приняты\n"
+            "3. Важные детали: файлы, функции, имена, технические решения\n"
+            "4. Что ещё нужно сделать / текущий статус\n\n"
+            "Формат: краткий, структурированный, на русском языке. "
+            "Только факты и решения, без воды. 3-7 абзацев."
+        )
+
+        accept_edits = session.mode == "work"
+        allowed_tools = self._get_discuss_tools() if not accept_edits else None
+
+        summary_text = ""
+        try:
+            async for event in runner.run(
+                message=compress_prompt,
+                cwd=cwd,
+                session_id=session.session_id,
+                continue_session=True,
+                allowed_tools=allowed_tools,
+                accept_edits=accept_edits,
+            ):
+                if isinstance(event, TextDelta):
+                    summary_text += event.text
+                elif isinstance(event, FinalResult):
+                    if event.text:
+                        summary_text = event.text
+                    break
+                elif isinstance(event, ErrorResult):
+                    self._post(channel_id, f"❌ Ошибка при сжатии: {event.error}", thread_id)
+                    return
+        except Exception:
+            logger.exception("Compress error")
+            self._post(channel_id, "❌ Ошибка при сжатии сессии.", thread_id)
+            return
+
+        if not summary_text.strip():
+            self._post(channel_id, "⚠️ Не удалось получить резюме — пустой ответ.", thread_id)
+            return
+
+        # Save summary and reset session
+        session.summary = summary_text.strip()
+        session.session_id = ""  # Force new session on next message
+        # Don't clear backend — keep it so we don't force backend recheck
+        self._save()
+
+        # Post summary for user
+        preview = summary_text[:300]
+        if len(summary_text) > 300:
+            preview += "..."
+        self._post(
+            channel_id,
+            f"✅ Сессия сжата ({len(summary_text)} символов).\n"
+            f"Контекст сохранён. Следующее сообщение начнёт новую сессию с этим резюме.\n\n"
+            f"📝 *{preview}*",
+            thread_id,
+        )
+
     async def _process_message(self, text: str, channel_id: str,
                                 thread_id: str, project_key: str) -> None:
         """Send message to AI backend and stream results."""
@@ -304,12 +587,39 @@ class MessageHandler:
         self._save()
         has_session = bool(session.session_id)
 
+        # Determine working directory: use work_dir if in work mode, else project path
+        cwd = session.work_dir if session.is_working else project["path"]
+
         # Prepend language instruction
         text = (
             "IMPORTANT: Always respond in Russian language (русский язык). "
             "Even if the user writes in English, answer in Russian.\n\n"
             + text
         )
+
+        # Inject compressed summary if starting new session after compression
+        if session.summary and not has_session:
+            text = (
+                f"COMPRESSED CONTEXT FROM PREVIOUS SESSION:\n"
+                f"Below is a summary of our earlier conversation. "
+                f"Treat this as the conversation history — you can refer to it naturally.\n\n"
+                f"--- BEGIN SUMMARY ---\n"
+                f"{session.summary}\n"
+                f"--- END SUMMARY ---\n\n"
+                f"The summary above was generated by you (the AI) when the user ran !compress. "
+                f"Use this context to maintain continuity.\n\n"
+                + text
+            )
+            # Clear summary after injecting into fresh session — it's now part of context
+            session.summary = ""
+            self._save()
+
+        # Add work mode context
+        if session.is_working:
+            text += (
+                f"\n\nNOTE: You are working in an isolated copy at `{session.work_dir}`.\n"
+                f"Branch: `{session.branch}`. All changes will be committed and pushed as a Merge Request."
+            )
 
         # Post initial status
         status_post = self._post(channel_id, "🤖 Thinking...", thread_id)
@@ -332,7 +642,7 @@ class MessageHandler:
         try:
             async for event in runner.run(
                 message=text,
-                cwd=project["path"],
+                cwd=cwd,
                 session_id=session.session_id if has_session else None,
                 continue_session=has_session,
                 allowed_tools=allowed_tools,
@@ -370,7 +680,7 @@ class MessageHandler:
                         self._post(channel_id, chunk, thread_id)
 
                 for rel_path in file_paths:
-                    self._send_file(channel_id, project["path"], rel_path, thread_id)
+                    self._send_file(channel_id, cwd, rel_path, thread_id)
 
         except Exception:
             logger.exception("AI backend processing error")
